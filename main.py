@@ -18,6 +18,8 @@ load_dotenv()
 
 EXCEPTION_SLEEP_INTERVAL = 60
 PLUGIN_SLEEP_INTERVAL = 60 * 15  # 15 minutes
+WEBHOOK_RETRY_ATTEMPTS = 5
+WEBHOOK_INITIAL_BACKOFF = 5  # seconds
 
 
 @dataclass
@@ -50,6 +52,7 @@ class BringPlugin:
         self.webhook_url = os.getenv("WEBHOOK_URL")
         self.bring = None
         self.existing_list = None
+        self.first_webhook_call = True
 
     async def grab_items(self, bring_list):
         """Grabs the items of the list using the list's uuid"""
@@ -59,31 +62,60 @@ class BringPlugin:
         print(f"Items = {bring_list.items}")
 
     async def send_list_to_trmnl(self, session, bring_list):
-        """Sends the list to TRMNL if it has changed"""
+        """Sends the list to TRMNL if it has changed, with retry logic"""
         if self.existing_list == bring_list:
             print("The items list hasn't changed since the last fetch.")
             print("Skipping sending updates to TRMNL.")
             return
         self.existing_list = bring_list
 
-        try:
-            await session.post(
-                self.webhook_url,
-                json={
-                    "merge_variables": {
-                        "items": self.existing_list.items,
-                        "list_name": self.existing_list.name,
-                    }
-                },
-                headers={"Content-Type": "application/json"},
-                raise_for_status=True,
-            )
+        # On first call, wait for Laravel to be ready
+        if self.first_webhook_call:
+            print("First webhook call - waiting 30s for TRMNL to be ready...")
+            await asyncio.sleep(30)
+            self.first_webhook_call = False
 
-            current_timestamp = datetime.datetime.now().isoformat()
-            print(f"Items sent successfully to TRMNL at {current_timestamp}")
-        except HTTPException as e:
-            print(f"Exception occurred during sending items to TRMNL: {e}")
+        for attempt in range(1, WEBHOOK_RETRY_ATTEMPTS + 1):
+            try:
+                await session.post(
+                    self.webhook_url,
+                    json={
+                        "merge_variables": {
+                            "items": self.existing_list.items,
+                            "list_name": self.existing_list.name,
+                        }
+                    },
+                    headers={"Content-Type": "application/json"},
+                    raise_for_status=True,
+                )
 
+                current_timestamp = datetime.datetime.now().isoformat()
+                print(f"Items sent successfully to TRMNL at {current_timestamp}")
+                return # Success, exit entry loop    
+                # except HTTPException as e:
+                # print(f"Exception occurred during sending items to TRMNL: {e}")
+
+            except aiohttp.ClientConnectorError as e:
+                # Connection refused - TRMNL not ready yet
+                if attempt < WEBHOOK_RETRY_ATTEMPTS:
+                    backoff = WEBHOOK_INITIAL_BACKOFF * (2 ** (attempt - 1))
+                    print(f"Connection failed (attempt {attempt}/{WEBHOOK_RETRY_ATTEMPTS}): {e}")
+                    print(f"Retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                else:
+                    print(f"Failed to connect to TRMNL after {WEBHOOK_RETRY_ATTEMPTS} attempts")
+                    raise
+
+            except HTTPException as e:
+                # HTTP error - likely a config issue, don't retry
+                print(f"HTTP error sending to TRMNL: {e}")
+                raise
+
+            except Exception as e:
+                # Unknown error
+                print(f"Unexpected error sending to TRMNL: {e}")
+                raise
+    
     async def run(self):
         """Start the plugin"""
         async with aiohttp.ClientSession() as session:
@@ -100,7 +132,7 @@ class BringPlugin:
 
                 await self.grab_items(new_list)
                 await self.send_list_to_trmnl(session, new_list)
-                time.sleep(PLUGIN_SLEEP_INTERVAL)
+                await asyncio.sleep(PLUGIN_SLEEP_INTERVAL)
 
 
 if __name__ == "__main__":
