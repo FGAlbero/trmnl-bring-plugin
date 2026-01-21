@@ -127,8 +127,23 @@ class BringPlugin:
                 if self.existing_list:
                     new_list = copy.deepcopy(self.existing_list)
                 else:
-                    bring_api_list = (await self.bring.load_lists()).lists[0]
+                    target_uuid = os.getenv("LIST_UUID")
+                    all_lists = (await self.bring.load_lists()).lists
+                    
+                    if target_uuid:
+                        # Find the list matching LIST_UUID
+                        bring_api_list = next(
+                            (lst for lst in all_lists if lst.listUuid == target_uuid),
+                            all_lists[0]  # Fallback to first list if UUID not found
+                        )
+                        print(f"Using list with UUID: {target_uuid}")
+                    else:
+                        # No UUID specified, use first list
+                        bring_api_list = all_lists[0]
+                        print(f"No LIST_UUID specified, using first list: {bring_api_list.name}")
+                    
                     new_list = BringList(name=bring_api_list.name, uuid=bring_api_list.listUuid)
+
 
                 await self.grab_items(new_list)
                 await self.send_list_to_trmnl(session, new_list)
